@@ -5,12 +5,14 @@ import { analyze } from "yuku-analyzer";
 import { fileOptions, load } from "yuku-core";
 import { parse } from "yuku-parser";
 import { load as loadInBrowser } from "../../npm/yuku-core/browser.js";
+import { loadSync as loadBrowserWasm } from "../../npm/yuku-core-wasm/index.js";
 import { corpusFiles, corpusPresent, projectFiles } from "../corpus";
 import { jsSource, tsSource } from "./sources";
 
 const native = load();
 const wasm = await wasmCore.load();
 const bytes = readFileSync(new URL("../../npm/yuku-core-wasm/yuku-core.wasm", import.meta.url));
+const wasmCores = [wasm, loadBrowserWasm(bytes)];
 
 const OPTION_SETS = [
   {},
@@ -23,7 +25,9 @@ function differences(source: string, options: object): string[] {
   const found: string[] = [];
   for (const entry of ["parse", "analyze"] as const) {
     const expected = Buffer.from(native[entry](source, resolved));
-    if (!expected.equals(Buffer.from(wasm[entry](source, resolved)))) found.push(entry);
+    for (const core of wasmCores) {
+      if (!expected.equals(Buffer.from(core[entry](source, resolved)))) found.push(entry);
+    }
   }
   return found;
 }
@@ -39,6 +43,26 @@ describe("the WebAssembly core matches the native core", () => {
   test("on strings of every UTF-16 sequence, lone surrogates read as U+FFFD", () => {
     const text = `é € 😀 \ud800 \udc00 ${"ascii past a chunk ".repeat(4)}😀`;
     expect(differences(`let s = "${text}";\nlet x = ;`, { lang: "ts" })).toEqual([]);
+  });
+
+  test("on an empty source when encodeInto repeats its last count, as in WebContainers", () => {
+    const encodeInto = TextEncoder.prototype.encodeInto;
+    let last = { read: 0, written: 0 };
+    TextEncoder.prototype.encodeInto = function (source, view) {
+      if (source) last = encodeInto.call(this, source, view);
+      return last;
+    };
+    try {
+      expect(differences(jsSource, {})).toEqual([]);
+      expect(differences("", {})).toEqual([]);
+    } finally {
+      TextEncoder.prototype.encodeInto = encodeInto;
+    }
+  });
+
+  test("on the fresh instance a huge file leaves behind", () => {
+    expect(differences(`[${"1, ".repeat(1_000_000)}];`, {})).toEqual([]);
+    expect(differences(tsSource, { lang: "ts" })).toEqual([]);
   });
 
   test.skipIf(!corpusPresent())(
